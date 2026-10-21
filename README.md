@@ -373,3 +373,505 @@ naming the thing.** Four of these five errors came from reading an identifier
 and inferring behaviour instead of reading the code that consumes it.
 
 ---
+## Appendix A — Tooling
+
+All scripts are plain Python 3 with no third-party dependencies. The only
+non-stdlib dependency is `libcompression.dylib`, which ships with macOS.
+
+### A.1 `dec.py` — im4p → LZFSE → Mach-O
+
+```python
+#!/usr/bin/env python3
+import ctypes, sys
+
+SZ = ctypes.c_size_t
+lib = ctypes.CDLL("/usr/lib/libcompression.dylib")
+lib.compression_decode_buffer.restype = SZ
+lib.compression_decode_buffer.argtypes = [
+    ctypes.c_void_p, SZ, ctypes.c_void_p, SZ, ctypes.c_void_p, ctypes.c_int]
+
+def decode(data, algo=0x801, cap=256 << 20):
+    src = ctypes.create_string_buffer(bytes(data), len(data))
+    out = ctypes.create_string_buffer(cap)
+    n = lib.compression_decode_buffer(out, cap, src, len(data), None, algo)
+    if not n:
+        raise RuntimeError("decode failed")
+    return out.raw[:n]
+
+def unwrap_im4p(path):
+    d = open(path, 'rb').read()
+    start = d.find(b'bvx2')
+    if start < 0:
+        raise RuntimeError("no bvx2 stream")
+    end = d.find(b'bvx$', start)
+    return d[start:(end + 4) if end > 0 else len(d)]
+
+if __name__ == '__main__':
+    if len(sys.argv) < 3:
+        print("usage: dec.py <im4p> <out.bin>"); raise SystemExit(2)
+    out = decode(unwrap_im4p(sys.argv[1]))
+    open(sys.argv[2], 'wb').write(out)
+    print("%s -> %s (%d bytes)" % (sys.argv[1], sys.argv[2], len(out)))
+```
+
+**Note on `argtypes`:** the ctypes signature must be
+`(dst, dst_size, src, src_len, scratch, algo)` — six arguments, **not** seven.
+Declaring the wrong arity silently produces `0` from
+`compression_decode_buffer` and looks exactly like corrupt input. This cost
+real time during the analysis.
+
+**Note on stream extent:** the whole im4p payload is **one** LZFSE stream from
+`bvx2` to `bvx$`, not a sequence of independent chunks. The string `bvx2`
+recurs ~11 times inside the compressed data by coincidence; treating each as a
+chunk boundary fails.
+
+### A.2 `sptm.py` — parser, xref scanner, string resolver
+
+```python
+import struct
+
+class SPTM:
+    def __init__(self, path):
+        self.d = open(path, 'rb').read()
+        self.segs = self._layout()
+
+    def _layout(self):
+        d = self.d
+        n = struct.unpack_from("<I", d, 16)[0]
+        p = 32; out = []
+        for _ in range(n):
+            cmd, size = struct.unpack_from("<II", d, p)
+            if cmd == 0x19:                                    # LC_SEGMENT_64
+                b = d[p:p+size]
+                out.append(dict(fileoff=struct.unpack_from("<Q", b, 40)[0],
+                                vmaddr =struct.unpack_from("<Q", b, 24)[0],
+                                filesize=struct.unpack_from("<Q", b, 48)[0],
+                                name   =b[8:24].rstrip(b'\0').decode()))
+            p += size
+        return out
+
+    def vm2off(self, vm):
+        for s in self.segs:
+            if s['vmaddr'] <= vm < s['vmaddr'] + s['filesize']:
+                return s['fileoff'] + (vm - s['vmaddr'])
+
+    def off2vm(self, off):
+        for s in self.segs:
+            if s['fileoff'] <= off < s['fileoff'] + s['filesize']:
+                return s['vmaddr'] + (off - s['fileoff'])
+
+    def text(self):
+        return [s for s in self.segs if s['name'] == '__TEXT_EXEC'][0]
+
+    def xrefs(self, target):
+        """adrp+add / adrp+ldr references to a VM address."""
+        t = self.text(); out = []
+        for off in range(t['fileoff'], t['fileoff'] + t['filesize'] - 16, 4):
+            w = struct.unpack_from("<I", self.d, off)[0]
+            if (w & 0x9f000000) != 0x90000000:                 # ADRP
+                continue
+            imm = (((w >> 5) & 0x7ffff) << 2) | ((w >> 29) & 3)
+            if imm & (1 << 20): imm -= (1 << 21)
+            pc = t['vmaddr'] + (off - t['fileoff'])
+            page = (pc & ~0xfff) + (imm << 12)
+            for k in (1, 2):
+                w2 = struct.unpack_from("<I", self.d, off + 4*k)[0]
+                if (w2 & 0xff800000) == 0x91000000 and page + ((w2 >> 10) & 0xfff) == target:
+                    out.append(pc)                             # ADD
+                elif (w2 & 0xffc00000) == 0xf9400000 and page + ((w2 >> 10) & 0xfff)*8 == target:
+                    out.append(pc)                             # LDR
+        return out
+
+    def string_at(self, vm, maxlen=160):
+        o = self.vm2off(vm)
+        if o is None: return None
+        e = self.d.find(b'\0', o)
+        if e < 0 or e - o > maxlen: return None
+        try: s = self.d[o:e].decode('ascii')
+        except UnicodeDecodeError: return None
+        return s if len(s) >= 4 else None
+
+    def find_str(self, needle):
+        i = self.d.find(needle.encode() if isinstance(needle, str) else needle)
+        return None if i < 0 else self.off2vm(i)
+
+    def func_start(self, vm, maxback=0x4000):
+        o = self.vm2off(vm)
+        for back in range(0, maxback, 4):
+            if struct.unpack_from("<I", self.d, o - back)[0] in (0xd503237f, 0xd503233f):
+                return vm - back
+```
+
+### A.3 `scan_flag.py` — load/store census
+
+The script that produced the gate-byte finding. **The critical detail is
+addressing-mode decoding**: `0x38491d4b` is a *pre-index* `ldrb w11,[x10,#0x91]!`
+and naive decoders mis-read it.
+
+```python
+from sptm import SPTM
+import struct
+
+DISP = 0x91
+s3 = SPTM("24B5099f/sptm.bin"); t = s3.text()
+
+def decode_ls(w):
+    rt = w & 0x1f; rn = (w >> 5) & 0x1f
+    if (w & 0x3b000000) == 0x39000000:            # unsigned immediate
+        size = (w >> 30) & 3; opc = (w >> 22) & 3
+        disp = ((w >> 10) & 0xfff) * (1 << size)  # <-- SCALED by access size
+        return (('LDR' if opc & 1 else 'STR') + 'BHXW'[size], rn, rt, disp, 'uoff')
+    if (w & 0x3b200c00) == 0x38000c00:            # post/pre-index, unscaled
+        size = (w >> 30) & 3; opc = (w >> 22) & 3
+        imm9 = (w >> 12) & 0x1ff
+        if imm9 & 0x100: imm9 -= 0x200
+        mode = (w >> 10) & 3
+        return (('LDR' if opc & 1 else 'STR') + 'BHXW'[size], rn, rt, imm9,
+                {1:'post', 3:'pre'}.get(mode, 'unscaled'))
+
+for off in range(t['fileoff'], t['fileoff'] + t['filesize'] - 8, 4):
+    w = struct.unpack_from("<I", s3.d, off)[0]
+    r = decode_ls(w)
+    if r and r[3] == DISP:
+        print("%#x %-6s base=x%-2d rt=x%-2d (%s)" % (t['vmaddr'] + (off - t['fileoff']),) + r)
+```
+
+Two bugs this file exists to avoid:
+
+1. **Displacement scaling.** For `LDR/STR (unsigned immediate)` the encoded
+   `imm12` is scaled by the access size. Comparing raw `imm12` to a byte
+   displacement misses every 64-bit access (`imm12*8`) and every 32-bit one
+   (`imm12*4`).
+2. **Pre/post-index.** `0x38491d4b` has `mode == 3` (pre-index) with
+   `imm9 = 0x91`. Reading it as post-index makes the offset look like 0.
+
+### A.4 `fdiff.py` — relocation-normalised function diff
+
+`adrp` page immediates and branch targets shift with load address, so a raw
+byte diff of two builds reports ~97% difference even for unchanged functions.
+This canonicalises:
+
+| instruction | normalised to |
+|---|---|
+| `ADRP` | `("ADRP", rd)` — page dropped |
+| `BL` / `B` | target dropped |
+| `B.cond`, `CBZ` | condition kept, offset dropped |
+| everything else | raw word kept |
+
+Anything not covered by the first three columns is compared verbatim, which
+means real structural changes surface and relocation noise does not.
+
+### A.5 `disasm_sptm.py` — inline AArch64 disassembler
+
+Subset sufficient for XNU/SPTM: `adrp`, `add`/`sub` immediate,
+`ldr`/`str` (X and W, unsigned offset), `mov` (wide immediate), `b`, `bl`,
+`b.cond`, plus the PAC/BTI landing pads (`pacibsp`, `paciasp`, `bti`, `ret`,
+`retab`). Prints `.word <hex>` for anything outside the subset rather than
+guessing — which is how the `movz`/`movk` pair and the undocumented
+system-register instructions were spotted as "outside the subset" and then
+decoded by hand.
+
+### A.6 Kernelcache-side tools
+
+Live in `kc/24A446__iPhone18,4/`:
+
+| file | purpose |
+|---|---|
+| `xref.py` | adrp+add/ldr xref scanner for kernelcache strings |
+| `disasm.py` | kernelcache AArch64 disassembler |
+| `../24A446__iPhone18,1/analysis/kc.py` | MH_FILESET parser + query CLI |
+| `../24A446__iPhone18,1/analysis/fixups.py` | arm64e chained-fixup decoder |
+| `../24A446__iPhone18,1/analysis/rebase_blob.py` | emit rebased per-section blobs |
+| `../24A446__iPhone18,1/analysis/ida_load.py` | IDA bootstrap for MH_FILESET |
+
+---
+
+## Appendix B — Reproduction
+
+### Step 1 — extract SPTM from the IPSWs
+
+`Firmware/sptm.t8150.release.im4p` is present in all three restore images.
+
+```bash
+mkdir -p sptm/{24A446,24B5084k,24B5099f}
+
+unzip -o -j iPhone18,4_27.0.1_24A446_Restore.ipsw \
+      "Firmware/sptm.t8150.release.im4p" -d sptm/24A446
+unzip -o -j iPhone18,4_27.2_24B5084k_Restore.ipsw \
+      "Firmware/sptm.t8150.release.im4p" -d sptm/24B5084k
+unzip -o -j iPhone18,4_27.2_24B5099f_Restore.ipsw \
+      "Firmware/sptm.t8150.release.im4p" -d sptm/24B5099f
+```
+
+Verify you have three different files (27.0.1 and b1 SPTM are the *same
+build*, but the im4p envelopes differ in padding):
+
+```bash
+shasum -a 256 sptm/*/sptm.t8150.release.im4p
+```
+
+### Step 2 — decompress to Mach-O
+
+```bash
+cd sptm
+python3 dec.py 24A446/sptm.t8150.release.im4p     24A446/sptm.bin
+python3 dec.py 24B5084k/sptm.t8150.release.im4p   24B5084k/sptm.bin
+python3 dec.py 24B5099f/sptm.t8150.release.im4p   24B5099f/sptm.bin
+```
+
+Expected sizes: **1,261,600** bytes for 27.0.1 and b1, **1,327,136** for b3.
+Each should begin with `cffaedfe` (little-endian `MH_MAGIC_64`).
+
+### Step 3 — confirm the scale of the change
+
+```bash
+python3 - <<'P'
+from sptm import SPTM
+import struct
+
+def text_section(s):
+    """Return (fileoff, size, vmaddr) of the __text SECTION in __TEXT_EXEC."""
+    d = s.d
+    n = struct.unpack_from("<I", d, 16)[0]; p = 32
+    for _ in range(n):
+        cmd, size = struct.unpack_from("<II", d, p)
+        if cmd == 0x19:
+            b = d[p:p+size]
+            if b[8:24].rstrip(b'\0') == b'__TEXT_EXEC':
+                ns = struct.unpack_from("<I", b, 64)[0]
+                for k in range(ns):
+                    sb = b[72+k*80:72+(k+1)*80]
+                    if sb[0:16].rstrip(b'\0') == b'__text':
+                        return (struct.unpack_from("<I", sb, 48)[0],
+                                struct.unpack_from("<Q", sb, 40)[0],
+                                struct.unpack_from("<Q", sb, 32)[0])
+        p += size
+
+for lbl, f in (("b1","24B5084k/sptm.bin"), ("b3","24B5099f/sptm.bin")):
+    s = SPTM(f)
+    fo, sz, vm = text_section(s)
+    dmb = sum(1 for o in range(len(s.d)-4)
+              if s.d[o:o+4] == bytes.fromhex('bf3f03d5'))
+    print("%s __text size %#x  dmb ish %d" % (lbl, sz, dmb))
+P
+```
+
+> Note: `s.text()` returns the **segment** (`__TEXT_EXEC`, size `0x68000`).
+> The `+3,320 B` figure in §2 is the **section** (`__text`) inside it. Do not
+> confuse them — the segment size is identical in both builds, so using it
+> would make the change look like zero.
+
+Expected:
+
+```
+b1 __text 0x61340  dmb ish 3
+b3 __text 0x62038  dmb ish 27
+```
+
+The `dmb ish` ratio is the single fastest signal that this release changes
+ordering rather than logic.
+
+### Step 4 — locate the flush entry point
+
+```bash
+python3 - <<'P'
+from sptm import SPTM
+s3 = SPTM("24B5099f/sptm.bin")
+t = s3.find_str("uat_sync_outer_tlb_sapt_flush")
+print("string vm:", hex(t))
+for x in s3.xrefs(t):
+    print("  xref %#x  func %#x" % (x, s3.func_start(x)))
+P
+```
+
+Expected:
+
+```
+string vm: 0xfffffff027005467
+  xref 0xfffffff0270c8018  func 0xfffffff0270c7acc
+  xref 0xfffffff0270c8afc  func 0xfffffff0270c8620
+  xref 0xfffffff0270c9d94  func 0xfffffff0270c98fc
+  xref 0xfffffff0270cb1d0  func 0xfffffff0270cad88
+  xref 0xfffffff02710b24c  func 0xfffffff02710a354
+```
+
+### Step 5 — find the gate byte
+
+```bash
+python3 scan_flag.py
+```
+
+Expected: five `LDRB ... (pre)` sites and one `STRB` — the five tests and the
+single release.
+
+### Step 6 — pair the functions across builds
+
+Anchor each b3 function by an internal string, then locate its b1 twin:
+
+```bash
+python3 - <<'P'
+from sptm import SPTM
+s3 = SPTM("24B5099f/sptm.bin"); s1 = SPTM("24B5084k/sptm.bin")
+for a in ("sptm_uat_remove_ctx_id",
+          "sapt_update_permissions_uat_unmap_sync",
+          "sptm_uat_prepare_fw_unmap_continue",
+          "uat_state_get_root_table_paddr"):
+    t3, t1 = s3.find_str(a), s1.find_str(a)
+    f3 = s3.func_start(s3.xrefs(t3)[0]) if t3 else None
+    f1 = s1.func_start(s1.xrefs(t1)[0]) if t1 else None
+    print("%-42s b1 %s  b3 %s" % (a, hex(f1) if f1 else "-", hex(f3) if f3 else "-"))
+P
+```
+
+Expected pairs (b3 is `+0x10000` from b1 for the first three):
+
+```
+sptm_uat_remove_ctx_id                      b1 0xfffffff0270b7acc  b3 0xfffffff0270c7acc
+sapt_update_permissions_uat_unmap_sync      b1 0xfffffff0270b847c  b3 0xfffffff0270c8620
+sptm_uat_prepare_fw_unmap_continue          b1 0xfffffff0270b95b0  b3 0xfffffff0270c98fc
+uat_state_get_root_table_paddr              b1 0xfffffff0270b8100  b3 0xfffffff0270c82a4
+```
+
+The first three grow ~0x1A8; the accessor grows by **0**.
+
+### Step 7 — decode the timeout constants
+
+```bash
+python3 - <<'P'
+# movz + 3x movk builds a 64-bit constant. Do NOT stop at the movz.
+seq = [0xd28432e9, 0xf2aeb1c9, 0xf2c36e29, 0xf2e001a9]
+val = 0
+for w in seq:
+    hw, imm = (w >> 21) & 3, (w >> 5) & 0xffff
+    val = (val & ~(0xffff << (16*hw))) | (imm << (16*hw))
+print("multiplier %#x  == ceil(2^65/10^4): %s" % (val, val == (1<<65)//10000 + 1))
+
+# timeout: movz w9,#0xd40 ; movk w9,#0x3,lsl #16
+t = (0xd40) | (0x3 << 16)
+print("timeout 0x%x = %d ticks" % (t, t))
+for hz in (24_000_000, 25_000_000):
+    print("  @ %d Hz = %.2f ms" % (hz, 1000*t/hz))
+P
+```
+
+Expected:
+
+```
+multiplier 0xd1b71758e2197  == ceil(2^65/10^4): True
+timeout 0x30d40 = 200000 ticks
+  @ 24000000 Hz = 8.33 ms
+  @ 25000000 Hz = 8.00 ms
+```
+
+### Step 8 — verify the status register is not a counter
+
+The decisive test. A timeout loop needs a comparison; a wait needs a loop.
+
+```bash
+python3 - <<'P'
+from sptm import SPTM
+import struct
+s3 = SPTM("24B5099f/sptm.bin"); t = s3.text()
+masked = compared = polled = 0
+for off in range(t['fileoff'], t['fileoff'] + t['filesize'] - 0x30, 4):
+    w = struct.unpack_from("<I", s3.d, off)[0]
+    if (w & 0xffffffe0) != 0xd53b4220:            # MRS S3_3_C4_C2_1
+        continue
+    vm = t['vmaddr'] + (off - t['fileoff'])
+    for k in range(1, 6):
+        w2 = struct.unpack_from("<I", s3.d, off + 4*k)[0]
+        if (w2 & 0x7f800000) == 0x72000000: masked += 1      # ANDS/TST imm
+        if (w2 & 0xff800000) == 0x71000000 and (w2 & 0x1f) == 31:
+            compared += 1                                     # CMP imm
+        if (w2 & 0xff000010) == 0x54000000:
+            imm = (w2 >> 5) & 0x7ffff
+            if imm & (1 << 18): imm -= (1 << 19)
+            if vm + 4*k + (imm << 2) <= vm: polled += 1       # backward branch
+print("masked %d  compared %d  polled %d" % (masked, compared, polled))
+P
+```
+
+Expected: `masked 16  compared 0  polled 0`.
+
+Zero comparisons excludes counter semantics. Zero backward branches excludes
+"wait for quiesce."
+
+### Step 9 — the AGX reachability check (negative result)
+
+```bash
+cd ../kc/24A446__iPhone18,4
+python3 - <<'P'
+import struct
+b3 = open("kernelcache.release.iPhone18,4.24B5099f", 'rb').read()
+TX_FO, TX_VM, TX_SZ = 0x14e5960, 0xfffffe00084e9960, 0xd81d0
+def v2o(vm): return TX_FO + (vm - TX_VM)
+def sx(v, b): return v - (1 << b) if v & (1 << (b - 1)) else v
+
+pc = 0xfffffe00085553fc
+w = struct.unpack_from("<I", b3, v2o(pc))[0]
+imm = (((w >> 5) & 0x7ffff) << 2) | ((w >> 29) & 3)
+page = (pc & ~0xfff) + (sx(imm, 21) << 12)
+w2 = struct.unpack_from("<I", b3, v2o(pc + 4))[0]
+tbl = page + ((w2 >> 10) & 0xfff)
+print("AGX jump table @ %#x" % tbl)
+for i in range(18):
+    off = struct.unpack_from("<i", b3, v2o(tbl + i*4))[0]
+    print("  sel %2d -> %#x" % (i, 0xfffffe0008555408 + off))
+P
+```
+
+Expected (verified):
+
+```
+AGX jump table @ 0xfffffe0008557020
+  sel  0 -> 0xfffffe0008555414
+  sel  1 -> 0xfffffe00085554a8
+  sel  2 -> 0xfffffe000855544c
+  sel  3 -> 0xfffffe0008555520
+  sel  4 -> 0xfffffe0008555560
+  sel  5 -> 0xfffffe00085569ec      <- error path
+  sel  6 -> 0xfffffe00085569ec
+  sel  7 -> 0xfffffe00085569ec
+  sel  8 -> 0xfffffe0008555470
+  sel  9 -> 0xfffffe00085554c4
+  sel 10 -> 0xfffffe00085569ec
+  sel 11 -> 0xfffffe00085554f4
+  sel 12 -> 0xfffffe00085555c0
+  sel 13 -> 0xfffffe00085569ec
+  sel 14 -> 0xfffffe00085555a0
+  sel 15 -> 0xfffffe00085569ec
+  sel 16 -> 0xfffffe0008555430
+  sel 17 -> 0xfffffe000855548c
+```
+
+12 distinct handlers, 6 slots routing to the shared error path at
+`0xfffffe00085569ec`. Every handler tail-calls `0xfffffe00085555ec`, which
+loads a virtual method through a PAC dispatch thunk and passes `#0x20` as a
+buffer size — the sampling interface described in §11.
+
+---
+
+## Appendix C — Known pitfalls
+
+Collected so the next person does not repeat them.
+
+| pitfall | symptom | correct approach |
+|---|---|---|
+| `ctypes` arity on `compression_decode_buffer` | returns `0`, looks like corrupt data | 6 args: `(dst, dst_sz, src, src_len, scratch, algo)` |
+| Treating every `bvx2` as a chunk | partial / failed decode | one stream, `bvx2` … `bvx$` |
+| `imm12` not scaled by access size | misses all 64-bit loads/stores | `disp = imm12 * (1 << size)` |
+| Pre-index read as post-index | offset looks like 0 | `mode = (w>>10)&3`; 3 = pre, 1 = post |
+| Stopping at `movz` | plausible wrong constant (7488 vs 200000) | follow the `movk` chain |
+| `sf` assumed instead of read | `DecodeBitMasks` returns `0x0`, a valid-looking answer | read width from bit 31 |
+| Raw byte diff of `__text` | ~97% "changed" from relocation alone | normalise `adrp`/branch immediates |
+| Vtable mistaken for dispatch table | in/out counts are garbage | check that the second dword is small |
+| Kext `__LINKEDIT` offsets used as file offsets | sections past EOF | segments are **virtual**; translate via the outer container |
+
+
+---
+
+## Credits
+
+- opa334 for the information about SPTM bypass patch
+- Lakr233 for TLB research idea
+- YuJunZhiXue for the dsh-purge plugin, this work wouldn't be possible without it
